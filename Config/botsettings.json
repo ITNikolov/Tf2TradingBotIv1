@@ -1,0 +1,13 @@
+﻿{
+  "backpackTfApiKey": "65749c51074ea6856e0c8b8e",
+  "priceRefreshIntervalMinutes": 15,
+  "buyLimits": {
+    "Australium Flame Thrower": 2,
+    "Golden Frying Pan": 1
+  },
+  "trackedItems": [
+    "Australium Flame Thrower",
+    "Golden Frying Pan",
+    "Mann Co. Supply Crate Key"
+  ]
+}
