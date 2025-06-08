@@ -1,63 +1,87 @@
-﻿using Newtonsoft.Json;
-using Tf2TradingBotIv1.Services;
+﻿using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Tf2TradingBotIv1.Data;
+using Tf2TradingBotIv1.Models;
 using Tf2TradingBotv1.Data;
-using Tf2TradingBotv1.Services;  
+using Tf2TradingBotv1.Models;
+using Tf2TradingBotv1.Services;
 
 namespace Tf2TradingBotv1
 {
-    public class BotSettings
-    {
-        public string backpackTfApiKey { get; set; }
-        public int priceRefreshIntervalMinutes { get; set; }
-        public Dictionary<string, int> buyLimits { get; set; }
-        public List<string> trackedItems { get; set; }
-    }
-
     class Program
     {
-        // holds your deserialized JSON
-        private static BotSettings _settings;
+        static BotSettings _settings;
+        static LiteDbService _db;
+        static ClassifiedPriceService _priceSvc;
+        static ClassifiedManager _classMgr;
+        static Timer _timer;
 
         static async Task Main(string[] args)
         {
             LoadConfig();
-            using var db = new LiteDbService();
 
-            // 1) Compute your cost floor (in scrap) from your stored PriceRecords or a fixed value
-            //    e.g. if you paid 2 refined for the item: costScrap = 2 * ScrapUtils.ScrapPerRef
-            int costFloor = 2 * ScrapUtils.ScrapPerRef;
+            // 1) Initialize services
+            _db = new LiteDbService();
+            _priceSvc = new ClassifiedPriceService(_settings.backpackTfApiKey);
+            _classMgr = new ClassifiedManager(_db, _settings.backpackTfApiKey);
 
-            // 2) Instantiate the ClassifiedPriceService
-            var priceService = new ClassifiedPriceService(_settings.backpackTfApiKey);
+            // 2) Kick off immediately, then every N minutes
+            _timer = new Timer(async _ => await RefreshCycle(),
+                               null,
+                               dueTime: TimeSpan.Zero,
+                               period: TimeSpan.FromMinutes(_settings.priceRefreshIntervalMinutes));
 
-            // 3) Fetch undercut prices
-            var livePrices = await priceService.GetPricesAsync(_settings.trackedItems, costFloor);
-
-            // 4) Inspect or persist these prices
-            foreach (var kv in livePrices)
-            {
-                var item = kv.Key;
-                var (buyScrap, sellScrap) = kv.Value;
-                var (k, r, rec, s) = ScrapUtils.FromScrap(buyScrap, refPerKey: /* your dynamic key→ref rate */0);
-                Console.WriteLine($"{item} → Buy: {k}k {r}r {rec}rec {s}s; Sell: …");
-
-                // e.g. upsert into LiteDB.Prices as before
-            }
-
-            Console.WriteLine("Done fetching undercut prices. Press ENTER to exit.");
+            Console.WriteLine("Bot is running. Press ENTER to stop.");
             Console.ReadLine();
+
+            // 3) Clean up
+            _timer.Dispose();
+            _db.Dispose();
         }
 
-        // ← This is the missing method! Add this below Main:
-        private static void LoadConfig()
+        static async Task RefreshCycle()
         {
-            var configPath = Path.Combine("Config", "botsettings.json");
-            if (!File.Exists(configPath))
-                throw new FileNotFoundException($"Could not find {configPath}");
+            try
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm}] Starting pricing cycle…");
 
-            var json = File.ReadAllText(configPath);
-            _settings = JsonConvert.DeserializeObject<BotSettings>(json);
-            Console.WriteLine($"Loaded {_settings.trackedItems.Count} items, refresh every {_settings.priceRefreshIntervalMinutes} min.");
+                // a) Get undercut prices
+                //    Pass your cost floor here (e.g. 50 ref = 50*9=450 scrap)
+                var prices = await _priceSvc.GetPricesAsync(
+                    _settings.trackedItems,
+                    costScrap: 450
+                );
+
+                // b) Persist to LiteDB
+                foreach (var kv in prices)
+                {
+                    _db.Prices.Upsert(new PriceRecord
+                    {
+                        Id = kv.Key,
+                        Buy = kv.Value.BuyScrap,
+                        Sell = kv.Value.SellScrap,
+                        LastUpdated = DateTime.UtcNow
+                    });
+                }
+
+                Console.WriteLine($"[{DateTime.Now:HH:mm}] Prices saved to DB.");
+
+                // c) Sync classifieds on backpack.tf
+                await _classMgr.SyncAllAsync();
+                Console.WriteLine($"[{DateTime.Now:HH:mm}] Classifieds sync complete.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Error during refresh] {ex.Message}");
+            }
+        }
+
+        static void LoadConfig()
+        {
+            var text = System.IO.File.ReadAllText("Config/botsettings.json");
+            _settings = Newtonsoft.Json.JsonConvert.DeserializeObject<BotSettings>(text);
+            Console.WriteLine($"Tracking {_settings.trackedItems.Count} items, interval = {_settings.priceRefreshIntervalMinutes} min.");
         }
     }
 }

@@ -1,10 +1,5 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net.Http;
-using System.Threading.Tasks;
-using Newtonsoft.Json.Linq;
-using Tf2TradingBotIv1.Services;
+﻿using Newtonsoft.Json.Linq;
+using static Tf2TradingBotv1.Services.ScrapUtils;
 
 namespace Tf2TradingBotv1.Services
 {
@@ -17,22 +12,26 @@ namespace Tf2TradingBotv1.Services
         {
             _apiKey = backpackTfApiKey;
         }
-   
+
+        
         public async Task<Dictionary<string, (int BuyScrap, int SellScrap)>>
             GetPricesAsync(IEnumerable<string> items, int costScrap = 0)
         {
+            // 0) Fetch a fresh key→ref rate
+            decimal refPerKey = await FetchKeyRefRateAsync();
+
             var result = new Dictionary<string, (int, int)>();
 
             foreach (var item in items)
             {
-                // 1) Pull all sell orders (intent=1) and buy orders (intent=0)
-                var sells = await FetchListingsAsync(item, intent: 1);
-                var buys = await FetchListingsAsync(item, intent: 0);
+                // 1) Pull raw classifieds
+                var sells = await FetchListingsAsync(item, intent: 1, refPerKey);
+                var buys = await FetchListingsAsync(item, intent: 0, refPerKey);
 
                 if (sells.Count == 0 || buys.Count == 0)
-                    continue;  // no data
+                    continue;  // skip if we have no market data
 
-                // 2) Trim out top/bottom 10% to remove anomalies
+                // 2) Trim top/bottom 10%
                 var goodSells = TrimOutliers(sells, 0.10);
                 var goodBuys = TrimOutliers(buys, 0.10);
 
@@ -40,7 +39,7 @@ namespace Tf2TradingBotv1.Services
                 int minSell = goodSells.Min();
                 int maxBuy = goodBuys.Max();
 
-                // 4) Undercut/overbid by exactly 1 scrap, but never sell below costScrap
+                // 4) Undercut/overbid by 1 scrap, respecting your floor
                 int sellScrap = Math.Max(minSell - 1, costScrap);
                 int buyScrap = maxBuy + 1;
 
@@ -50,24 +49,40 @@ namespace Tf2TradingBotv1.Services
             return result;
         }
 
-        private static List<int> TrimOutliers(List<int> data, double pct)
+        
+        private async Task<decimal> FetchKeyRefRateAsync()
         {
-            data.Sort();
-            int drop = (int)(data.Count * pct);
-            return data.Skip(drop)
-                       .Take(data.Count - 2 * drop)
-                       .ToList();
+            const string keyName = "Mann Co. Supply Crate Key";
+
+            // intent=1 pulls sell orders
+            var sells = await FetchListingsAsync(keyName, intent: 1, refPerKey: 9m/*dummy*/);
+            // Convert each scrap→ref ( scrap / 9 )
+            var sellRefs = sells
+                .Select(s => Math.Round(s / (decimal)ScrapPerRef, 2))
+                .OrderBy(r => r)
+                .ToList();
+
+            if (sellRefs.Count == 0)
+                throw new InvalidOperationException("No key sell listings found.");
+
+            int mid = sellRefs.Count / 2;
+            return (sellRefs.Count % 2 == 1)
+                ? sellRefs[mid]
+                : (sellRefs[mid - 1] + sellRefs[mid]) / 2;
         }
 
-        private async Task<List<int>> FetchListingsAsync(string itemName, int intent)
+       
+        private async Task<List<int>> FetchListingsAsync(
+            string itemName,
+            int intent,
+            decimal refPerKey)
         {
-            // Build URL
-            var url = $"https://backpack.tf/api/IGetClassifieds/v1" +
-                      $"?key={_apiKey}" +
-                      $"&intent={intent}" +
+            var url = $"https://backpack.tf/api/IGetClassifieds/v1?" +
+                      $"key={_apiKey}&intent={intent}" +
                       $"&item_name={Uri.EscapeDataString(itemName)}";
+            Console.WriteLine("→ Testing key URL: " + url);
 
-            var resp = await _http.GetAsync(url);
+            using var resp = await _http.GetAsync(url);
             if (!resp.IsSuccessStatusCode)
                 return new List<int>();
 
@@ -77,13 +92,19 @@ namespace Tf2TradingBotv1.Services
             var prices = new List<int>();
             foreach (var c in cls)
             {
-                // Convert keys + metal → scrap
                 int keys = (int?)c["currencies"]["keys"] ?? 0;
-                decimal m = (decimal?)c["currencies"]["metal"] ?? 0m;
-                int scrap = ScrapUtils.ToScrap(keys, 0, 0, (int)Math.Round(m),  // metal→scrap via ScrapUtils
-                                              refPerKey: 0 /*not used here*/);
+                decimal metalRef = (decimal?)c["currencies"]["metal"] ?? 0m;
 
-                // Optionally skip “spell”/“effect” listings
+                // Convert everything → scrap
+                int scrap = ToScrap(
+                    keys: keys,
+                    refined: 0,
+                    reclaimed: 0,
+                    scrap: (int)Math.Round(metalRef * ScrapPerRef),
+                    refPerKey: refPerKey
+                );
+
+                // Skip weird “spell” or “effect” listings
                 var details = (string)c["details"] ?? "";
                 if (details.Contains("spell", StringComparison.OrdinalIgnoreCase) ||
                     details.Contains("effect", StringComparison.OrdinalIgnoreCase))
@@ -92,6 +113,13 @@ namespace Tf2TradingBotv1.Services
                 prices.Add(scrap);
             }
             return prices;
+        }
+
+        private static List<int> TrimOutliers(List<int> data, double pct)
+        {
+            data.Sort();
+            int drop = (int)(data.Count * pct);
+            return data.Skip(drop).Take(data.Count - 2 * drop).ToList();
         }
     }
 }
